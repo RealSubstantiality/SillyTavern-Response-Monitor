@@ -1,11 +1,11 @@
 {
   "display_name": "响应监听助手",
   "author": "RealSubstantiality",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "js": "Response Monitor.js",
   "auto_update": true,
   "generate_interceptor": "failNotificationIntercept",
-  "homePage": "https://github.com/RealSubstantiality/Response-Monitor/"
+  "homePage": "https://github.com/RealSubstantiality/SillyTavern-Response-Monitor/"
 }
 
 

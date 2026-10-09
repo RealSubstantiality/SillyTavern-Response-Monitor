@@ -1,28 +1,137 @@
-// Response Monitor v1.3.2
+// Response Monitor v1.3.3
 // - 失败/空内容/成功生成 独立蜂鸣提示（含 iOS 振荡器兜底）、Android 振动
 // - text/html/Cloudflare 错误页判失败
 // - 成功提示支持“仅在后台生效”
 // - 系统通知(需权限；iOS 仅 PWA 可用)
 // - 标题闪烁提醒（可开关）
 // - 扩展面板按钮/输入统一样式与分类排版（双栏设计，同行输入框）
-// - 深度检测流式 JSON 解决 API 假响应/空回问题
+// - 完整解析流式 SSE/JSON、隔离请求状态和可选诊断日志
 
 (() => {
   const MODULE = 'fail_notification';
 
   // ---------- 内容有效性深度探测 ----------
-  const contentRegex = /"(?:content|text|value|response|reply|token)"\s*:\s*"([^"])/i;
+  // Fetch chunks have arbitrary boundaries. Only examine complete responses.
+  function hasVisibleText(value) {
+    return typeof value === 'string' && value.trim().length > 0;
+  }
 
-  function hasActualContent(str) {
-      if (!str) return false;
-      if (str.trim() === 'data: [DONE]') return false;
-      
-      if (str.includes('":')) {
-          return contentRegex.test(str);
+  function hasTextParts(parts) {
+    return Array.isArray(parts) && parts.some(part =>
+      typeof part === 'string'
+        ? hasVisibleText(part)
+        : part && typeof part === 'object' &&
+          (part.type === 'text' || part.type === 'output_text' || part.type === undefined) &&
+          hasVisibleText(part.text)
+    );
+  }
+
+  // Only generated output counts (not roles, usage, reasoning or tool calls).
+  function hasGeneratedContent(data) {
+    if (!data || typeof data !== 'object' || data.error) return false;
+
+    if (Array.isArray(data.choices)) {
+      return data.choices.some(choice => {
+        if (!choice || (choice.index != null && choice.index !== 0)) return false;
+        const delta = choice.delta;
+        const message = choice.message;
+        return hasVisibleText(choice.text) ||
+          hasVisibleText(delta?.text) ||
+          hasVisibleText(delta?.content) ||
+          hasTextParts(delta?.content) ||
+          hasVisibleText(message?.content) ||
+          hasTextParts(message?.content);
+      });
+    }
+
+    if (Array.isArray(data.candidates)) {
+      return data.candidates.some((candidate, index) =>
+        index === 0 && hasTextParts(candidate?.content?.parts)
+      );
+    }
+
+    if (Array.isArray(data.output)) {
+      return data.output.some(item =>
+        item?.type === 'message' && hasTextParts(item.content)
+      );
+    }
+
+    // Anthropic, Cohere, Ollama and other text-generation backends.
+    return hasVisibleText(data.delta?.text) ||
+      hasVisibleText(data.delta?.message?.content?.text) ||
+      hasVisibleText(data.content_block?.type === 'text' ? data.content_block.text : null) ||
+      hasVisibleText(data.message?.content) ||
+      hasTextParts(data.message?.content) ||
+      hasVisibleText(data.response) ||
+      hasVisibleText(data.generated_text) ||
+      hasVisibleText(data.text) ||
+      hasVisibleText(data.reply) ||
+      hasVisibleText(data.content) ||
+      hasTextParts(data.content) ||
+      hasVisibleText(data.results?.[0]?.text) ||
+      hasVisibleText(data.token?.text);
+  }
+
+  // Return an error verdict as well as text presence. HTTP 200 is not proof
+  // of a successful generation when the stream contains an error event.
+  function analyzeResponseBody(body, contentType = '') {
+    const raw = typeof body === 'string' ? body.replace(/^\uFEFF/, '') : '';
+    if (!raw.trim()) return { hasContent: false, isError: false, reason: 'empty-body' };
+    if (isBadCT(contentType) || looksLikeHtml(raw)) {
+      return { hasContent: false, isError: true, reason: 'html-error-page' };
+    }
+
+    const isSse = /text\/event-stream/i.test(contentType) ||
+      /(?:^|\r?\n)(?:data|event|id|retry):|(?:^|\r?\n):/m.test(raw);
+    if (isSse) {
+      const blocks = raw.replace(/\r\n?/g, '\n').split(/\n[ \t]*\n/);
+      let sawContent = false;
+      let sawError = false;
+      let sawData = false;
+      for (const block of blocks) {
+        const lines = block.split('\n');
+        let eventName = '';
+        const dataLines = [];
+        for (const line of lines) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim().toLowerCase();
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+          else if (line === 'data') dataLines.push('');
+        }
+        if (!dataLines.length) continue; // comments, pings and event-only frames
+        sawData = true;
+        const payload = dataLines.join('\n').trim();
+        if (!payload || payload === '[DONE]') continue;
+        if (eventName === 'error') { sawError = true; continue; }
+
+        try {
+          const value = JSON.parse(payload);
+          if (value?.error || value?.type === 'error') sawError = true;
+          else if (hasGeneratedContent(value)) sawContent = true;
+        } catch {
+          // Only explicitly labelled plain-text tokens count as output.
+          if (eventName === 'token' && hasVisibleText(payload)) sawContent = true;
+        }
       }
-      
-      const plain = str.replace(/data:\s*\[DONE\]/gi, '').replace(/data:/gi, '').trim();
-      return plain.length > 0;
+      return {
+        hasContent: sawContent,
+        isError: sawError,
+        reason: sawError ? 'sse-error' : sawContent ? 'sse-text' : sawData ? 'sse-no-text' : 'sse-no-data',
+      };
+    }
+
+    const trimmed = raw.trim();
+    try {
+      const value = JSON.parse(trimmed);
+      const isError = Boolean(value?.error || value?.type === 'error');
+      const hasContent = typeof value === 'string' ? hasVisibleText(value) : hasGeneratedContent(value);
+      return { hasContent, isError, reason: isError ? 'json-error' : hasContent ? 'json-text' : 'json-no-text' };
+    } catch {
+      // Malformed JSON must never be mistaken for a plain-text reply.
+      if (/^[\[{]/.test(trimmed)) {
+        return { hasContent: false, isError: false, reason: 'invalid-json' };
+      }
+      return { hasContent: hasVisibleText(trimmed), isError: false, reason: 'plain-text' };
+    }
   }
 
   // ---------- HTML 错误页识别 ----------
@@ -64,6 +173,7 @@
     enabled: true,
     alertOnError: true,
     alertOnEmpty: true,
+    debug: false,
     
     alertOnSuccess: false,      
     successBackgroundOnly: false, 
@@ -295,39 +405,40 @@
 
   // ---------- 一轮生成侦测 ----------
   const CFG = { armMs: 20000 };
-  let armedUntil = 0, roundActive = false, gotContent = false, userAborted = false;
+  let armedUntil = 0;
+  let activeRound = null;
+  let roundSerial = 0;
 
   function arm() { armedUntil = Date.now() + CFG.armMs; }
   const isArmed = () => Date.now() <= armedUntil;
-  function startRound() { roundActive = true; gotContent = false; userAborted = false; }
-  function markContent() { if (roundActive) gotContent = true; }
-  function markAbort() { if (roundActive) userAborted = true; }
+  function startRound() {
+    const round = { id: ++roundSerial, hasContent: false, aborted: false, finished: false, status: null };
+    activeRound = round;
+    return round;
+  }
+  function markContent(round) { if (round && !round.finished) round.hasContent = true; }
+  function markAbort(round) { if (round && !round.finished) round.aborted = true; }
 
-  function endRound(isRequestOk) {
-    if (!roundActive) return;
-    const hasContent = gotContent;
-    const aborted = userAborted;
-    roundActive = false;
+  function endRound(round, isRequestOk, reason = '') {
+    if (!round || round.finished) return;
+    round.finished = true;
+    if (activeRound !== round) return; // stale requests cannot finish newer ones
+    activeRound = null;
 
-    if (aborted) return; 
-
-    let shouldAlertFail = false;
-    let alertPrefix = '';
-
-    if (!isRequestOk && S.alertOnError) {
-        shouldAlertFail = true;
-        alertPrefix = '请求报错';
+    const outcome = round.aborted ? 'aborted'
+      : !isRequestOk ? 'request-error'
+      : !round.hasContent ? 'empty'
+      : 'success';
+    if (S.debug) {
+      // Never log the prompt, response text, headers or API key.
+      console.info('[Response Monitor] generation #' + round.id, {
+        status: round.status, outcome, reason, hasContent: round.hasContent,
+      });
     }
-    else if (isRequestOk && !hasContent && S.alertOnEmpty) {
-        shouldAlertFail = true;
-        alertPrefix = '返回空内容';
-    }
-
-    if (shouldAlertFail) {
-        triggerFailAlert(alertPrefix);
-    } else if (isRequestOk && hasContent && S.alertOnSuccess) {
-        triggerSuccessAlert();
-    }
+    if (round.aborted) return;
+    if (outcome === 'request-error' && S.alertOnError) triggerFailAlert('请求报错');
+    else if (outcome === 'empty' && S.alertOnEmpty) triggerFailAlert('返回空内容');
+    else if (outcome === 'success' && S.alertOnSuccess) triggerSuccessAlert();
   }
 
   globalThis.failNotificationIntercept = function (payload) {
@@ -335,6 +446,13 @@
     arm();
     return payload;
   };
+
+  // Suppress notifications when generation is manually stopped.
+  const events = ctx.eventSource;
+  const eventTypes = ctx.eventTypes;
+  if (events?.on && eventTypes?.GENERATION_STOPPED) {
+    events.on(eventTypes.GENERATION_STOPPED, () => markAbort(activeRound));
+  }
 
   const GEN_ALLOW = [
     /\/api\/openai\/chat\/completions/i, /\/api\/openai\/completions/i,
@@ -355,55 +473,38 @@
     window.fetch = async (...args) => {
       const [input, init] = args;
       const url = typeof input === 'string' ? input : (input?.url || '');
-      const method = (init?.method || 'GET').toUpperCase();
+      const method = String(init?.method || input?.method || 'GET').toUpperCase();
       const watch = isArmed() && isGen(url, method);
-      if (watch) startRound();
+      const round = watch ? startRound() : null;
 
       try {
         const res = await orig(...args);
         if (!watch) return res;
-
         const ct = res.headers?.get?.('content-type') || '';
-        let isRequestOk = !!res.ok && !isBadCT(ct);
-
+        const isRequestOk = !!res.ok && !isBadCT(ct);
+        round.status = res.status;
         try {
-          const clone = res.clone();
-          if (clone.body?.getReader) {
-            (async () => {
-              try {
-                const reader = clone.body.getReader();
-                const decoder = new TextDecoder('utf-8');
-                let buffer = '';
-                
-                for (;;) {
-                  const { value, done } = await reader.read();
-                  if (done) break;
-                  if (!gotContent && value?.length) {
-                    buffer += decoder.decode(value, { stream: true });
-                    if (hasActualContent(buffer)) {
-                      markContent();
-                      buffer = ''; 
-                    } else if (buffer.length > 500) {
-                      buffer = buffer.slice(-100); 
-                    }
-                  }
-                }
-              } catch {}
-              finally { endRound(isRequestOk); }
-            })();
-          } else {
-            clone.text().then(t => {
-              if (!gotContent && hasActualContent(t)) markContent();
-              if (isRequestOk && looksLikeHtml(t)) isRequestOk = false;
-              endRound(isRequestOk);
-            }).catch(() => endRound(isRequestOk));
-          }
-        } catch { endRound(isRequestOk); }
-
+          // Clone the response without consuming or altering SillyTavern's stream.
+          // Await the complete body, never inspect incomplete transport chunks.
+          res.clone().text().then(body => {
+            const verdict = analyzeResponseBody(body, ct);
+            if (verdict.hasContent) markContent(round);
+            endRound(round, isRequestOk && !verdict.isError, verdict.reason);
+          }).catch(err => {
+            if (err?.name === 'AbortError' || init?.signal?.aborted || input?.signal?.aborted) {
+              markAbort(round);
+            }
+            endRound(round, false, 'stream-read-error');
+          });
+        } catch {
+          endRound(round, false, 'response-clone-error');
+        }
         return res;
       } catch (err) {
-        if (watch && (err?.name === 'AbortError' || err?.code === 20)) { markAbort(); endRound(true); }
-        else if (watch) { endRound(false); }
+        if (watch) {
+          if (err?.name === 'AbortError' || err?.code === 20) markAbort(round);
+          endRound(round, false, 'fetch-error');
+        }
         throw err;
       }
     };
@@ -422,26 +523,25 @@
     XHR.prototype.send = function (...args) {
       try {
         const { method, url } = this.__meta || {};
-        const watch = isArmed() && isGen(url, method);
-        if (watch) {
-          startRound();
+        if (isArmed() && isGen(url, method)) {
+          const round = startRound();
           this.addEventListener('loadend', () => {
-            const ok = this.status >= 200 && this.status < 400;
-            const txt = this.responseText || '';
-            
-            if (!gotContent && hasActualContent(txt)) markContent();
-
+            let txt = '';
+            try { txt = typeof this.responseText === 'string' ? this.responseText : ''; } catch {}
             const ct = (this.getResponseHeader && this.getResponseHeader('content-type')) || '';
-            let isRequestOk = ok && !isBadCT(ct);
-            if (isRequestOk && looksLikeHtml(txt)) isRequestOk = false;
-
-            endRound(isRequestOk);
+            const verdict = analyzeResponseBody(txt, ct);
+            round.status = this.status;
+            if (verdict.hasContent) markContent(round);
+            const ok = this.status >= 200 && this.status < 300 && !isBadCT(ct);
+            endRound(round, ok && !verdict.isError, verdict.reason);
           });
-          this.addEventListener('error',   () => endRound(false));
-          this.addEventListener('timeout', () => endRound(false));
-          this.addEventListener('abort',   () => { markAbort(); endRound(true); });
+          this.addEventListener('error', () => endRound(round, false, 'xhr-error'));
+          this.addEventListener('timeout', () => endRound(round, false, 'xhr-timeout'));
+          this.addEventListener('abort', () => { markAbort(round); endRound(round, false, 'xhr-abort'); });
         }
-      } catch {}
+      } catch (err) {
+        if (S.debug) console.warn('[Response Monitor] XHR hook error', err?.name);
+      }
       return _send.apply(this, args);
     };
     XHR.prototype.__fn120 = true;
@@ -477,8 +577,8 @@
       if (now - lastGlobalErrAt < 400) return;
       lastGlobalErrAt = now;
 
-      if (typeof roundActive !== 'undefined' && roundActive) {
-        try { endRound(false); } catch {}
+      if (activeRound) {
+        try { endRound(activeRound, false, 'global-error'); } catch {}
       } else {
         triggerFailAlert('报错', reasonStr);
       }
@@ -782,6 +882,7 @@
 
     // 5. 测试区
     content.append(makeDivider('功能测试'));
+    content.append(makeCheckbox('输出诊断日志（不记录回复内容）', 'debug'));
     content.append(makeTestRow());
 
     drawer.append(header, content);
