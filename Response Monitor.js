@@ -1,4 +1,4 @@
-// Response Monitor v1.3.3
+// Response Monitor v1.3.4
 // - 失败/空内容/成功生成 独立蜂鸣提示（含 iOS 振荡器兜底）、Android 振动
 // - text/html/Cloudflare 错误页判失败
 // - 成功提示支持“仅在后台生效”
@@ -404,41 +404,167 @@
   }
 
   // ---------- 一轮生成侦测 ----------
-  const CFG = { armMs: 20000 };
+  const CFG = { armMs: 20000, uiWaitMs: 6000 };
   let armedUntil = 0;
   let activeRound = null;
   let roundSerial = 0;
+  let generationSerial = 0;
+  let generation = null;
+
+  function getLiveContext() {
+    try { return globalThis.SillyTavern?.getContext?.() ?? ctx; }
+    catch { return ctx; }
+  }
+
+  function snapshotChat() {
+    const current = getLiveContext();
+    const chat = current?.chat;
+    if (!Array.isArray(chat)) return null;
+    const last = chat[chat.length - 1];
+    return {
+      chatId: current.chatId,
+      count: chat.length,
+      message: last || null,
+      text: typeof last?.mes === 'string' ? last.mes : '',
+      swipeId: last?.swipe_id,
+      genStarted: last?.gen_started ? String(last.gen_started) : '',
+    };
+  }
+
+  function hasVisibleReply(value) {
+    return typeof value === 'string' && value.trim() !== '' && value.trim() !== '...';
+  }
+
+  // Inspect the message corresponding to THIS generation, never a previous
+  // swipe's content or an unchanged continuation prefix.
+  function inspectFinalReply(round) {
+    const before = round.generation?.before ?? round.before;
+    const after = snapshotChat();
+    if (!before || !after) return { valid: null, reason: 'chat-context-unavailable' };
+    if (before.chatId !== after.chatId) return { valid: false, reason: 'chat-changed' };
+    if (!after.message || after.message.is_user) return { valid: false, reason: 'no-assistant-message' };
+    if (!hasVisibleReply(after.text)) return { valid: false, reason: 'rendered-reply-empty' };
+
+    const kind = round.generation?.type || 'normal';
+    const changedMessage = after.count > before.count || after.message !== before.message;
+    const changedGeneration = after.genStarted !== before.genStarted && Boolean(after.genStarted);
+    const changedText = after.text !== before.text;
+    const changedSwipe = after.swipeId !== before.swipeId;
+
+    if (kind === 'continue' || kind === 'append') {
+      if (!changedText && !changedMessage) {
+        return { valid: false, reason: 'unchanged-continuation' };
+      }
+      if (before.text && after.text.startsWith(before.text)) {
+        return {
+          valid: hasVisibleReply(after.text.slice(before.text.length)),
+          reason: 'continuation-delta',
+        };
+      }
+      return { valid: changedText || changedMessage, reason: 'continuation-rewritten' };
+    }
+
+    // A newly generated swipe may already have an incremented swipe_id before
+    // GENERATION_STARTED. The recorded baseline text and generation timestamp
+    // are therefore also needed to distinguish it from the previous swipe.
+    if (!changedMessage && !changedSwipe && !changedGeneration && !changedText) {
+      return { valid: false, reason: 'previous-reply-unchanged' };
+    }
+    return { valid: true, reason: kind === 'swipe' ? 'new-swipe-text' : 'new-message-text' };
+  }
 
   function arm() { armedUntil = Date.now() + CFG.armMs; }
   const isArmed = () => Date.now() <= armedUntil;
+
   function startRound() {
-    const round = { id: ++roundSerial, hasContent: false, aborted: false, finished: false, status: null };
+    const round = {
+      id: ++roundSerial,
+      hasContent: false,
+      aborted: false,
+      finished: false,
+      responseFinished: false,
+      requestOk: false,
+      uiFinished: false,
+      status: null,
+      reason: '',
+      timeout: null,
+      generation,
+      before: snapshotChat(),
+    };
+    if (activeRound?.timeout) clearTimeout(activeRound.timeout);
     activeRound = round;
     return round;
   }
+
   function markContent(round) { if (round && !round.finished) round.hasContent = true; }
   function markAbort(round) { if (round && !round.finished) round.aborted = true; }
 
-  function endRound(round, isRequestOk, reason = '') {
-    if (!round || round.finished) return;
+  function finalizeRound(round, uiVerdict = null) {
+    if (!round || round.finished || activeRound !== round) return;
     round.finished = true;
-    if (activeRound !== round) return; // stale requests cannot finish newer ones
+    if (round.timeout) clearTimeout(round.timeout);
     activeRound = null;
 
-    const outcome = round.aborted ? 'aborted'
-      : !isRequestOk ? 'request-error'
-      : !round.hasContent ? 'empty'
+    const invalidContext = uiVerdict?.reason === 'chat-changed';
+    const hasReply = round.hasContent && uiVerdict?.valid !== false;
+    const outcome = round.aborted || invalidContext ? 'aborted'
+      : !round.requestOk ? 'request-error'
+      : !hasReply ? 'empty'
       : 'success';
+
     if (S.debug) {
-      // Never log the prompt, response text, headers or API key.
-      console.info('[Response Monitor] generation #' + round.id, {
-        status: round.status, outcome, reason, hasContent: round.hasContent,
+      console.info('[Response Monitor v1.3.4] generation #' + round.id, {
+        status: round.status,
+        outcome,
+        network: round.reason,
+        rendered: uiVerdict?.reason ?? 'not-applicable',
+        hasNetworkText: round.hasContent,
+        hasFinalText: uiVerdict?.valid ?? null,
+        type: round.generation?.type ?? 'unknown',
       });
     }
-    if (round.aborted) return;
     if (outcome === 'request-error' && S.alertOnError) triggerFailAlert('请求报错');
     else if (outcome === 'empty' && S.alertOnEmpty) triggerFailAlert('返回空内容');
     else if (outcome === 'success' && S.alertOnSuccess) triggerSuccessAlert();
+  }
+
+  function maybeFinishRound(round) {
+    if (!round || round.finished || activeRound !== round || !round.responseFinished) return;
+    // An HTTP/network-level empty response must never be promoted to success.
+    if (!round.requestOk || !round.hasContent || round.aborted) {
+      finalizeRound(round);
+      return;
+    }
+
+    const type = round.generation?.type;
+    const canInspectUi = Boolean(events?.on && eventTypes?.GENERATION_ENDED);
+    // Quiet and impersonate requests do not create a chat message.
+    if (!canInspectUi || type === 'quiet' || type === 'impersonate') {
+      finalizeRound(round);
+      return;
+    }
+
+    if (!round.uiFinished) {
+      // SillyTavern may still be cleaning/saving a message after the network
+      // stream closes. Do not play success sound until the UI is finalized.
+      if (!round.timeout) {
+        round.timeout = setTimeout(() => {
+          round.timeout = null;
+          round.uiFinished = true;
+          maybeFinishRound(round);
+        }, CFG.uiWaitMs);
+      }
+      return;
+    }
+    finalizeRound(round, inspectFinalReply(round));
+  }
+
+  function endRound(round, isRequestOk, reason = '') {
+    if (!round || round.finished) return;
+    round.requestOk = isRequestOk;
+    round.reason = reason;
+    round.responseFinished = true;
+    maybeFinishRound(round);
   }
 
   globalThis.failNotificationIntercept = function (payload) {
@@ -447,11 +573,30 @@
     return payload;
   };
 
-  // Suppress notifications when generation is manually stopped.
   const events = ctx.eventSource;
   const eventTypes = ctx.eventTypes;
-  if (events?.on && eventTypes?.GENERATION_STOPPED) {
-    events.on(eventTypes.GENERATION_STOPPED, () => markAbort(activeRound));
+  if (events?.on && eventTypes) {
+    if (eventTypes.GENERATION_STARTED) {
+      events.on(eventTypes.GENERATION_STARTED, (type, _options, dryRun) => {
+        if (dryRun) return;
+        generation = { id: ++generationSerial, type, before: snapshotChat() };
+      });
+    }
+    if (eventTypes.GENERATION_STOPPED) {
+      events.on(eventTypes.GENERATION_STOPPED, () => markAbort(activeRound));
+    }
+    if (eventTypes.CHAT_CHANGED) {
+      events.on(eventTypes.CHAT_CHANGED, () => markAbort(activeRound));
+    }
+    if (eventTypes.GENERATION_ENDED) {
+      events.on(eventTypes.GENERATION_ENDED, () => {
+        const round = activeRound;
+        if (!round || round.finished || round.uiFinished) return;
+        round.uiFinished = true;
+        // Give the generation-stopped event from a manual stop a chance to fire.
+        setTimeout(() => maybeFinishRound(round), 0);
+      });
+    }
   }
 
   const GEN_ALLOW = [
@@ -476,7 +621,6 @@
       const method = String(init?.method || input?.method || 'GET').toUpperCase();
       const watch = isArmed() && isGen(url, method);
       const round = watch ? startRound() : null;
-
       try {
         const res = await orig(...args);
         if (!watch) return res;
@@ -484,16 +628,14 @@
         const isRequestOk = !!res.ok && !isBadCT(ct);
         round.status = res.status;
         try {
-          // Clone the response without consuming or altering SillyTavern's stream.
-          // Await the complete body, never inspect incomplete transport chunks.
+          // Keep the original stream untouched. Parse its clone only once
+          // all transport chunks have arrived.
           res.clone().text().then(body => {
             const verdict = analyzeResponseBody(body, ct);
             if (verdict.hasContent) markContent(round);
             endRound(round, isRequestOk && !verdict.isError, verdict.reason);
           }).catch(err => {
-            if (err?.name === 'AbortError' || init?.signal?.aborted || input?.signal?.aborted) {
-              markAbort(round);
-            }
+            if (err?.name === 'AbortError' || init?.signal?.aborted || input?.signal?.aborted) markAbort(round);
             endRound(round, false, 'stream-read-error');
           });
         } catch {
@@ -795,7 +937,7 @@
     const header = document.createElement('div');
     header.className = 'inline-drawer-toggle inline-drawer-header';
     const title = document.createElement('b');
-    title.textContent = '响应监听助手';
+    title.textContent = '响应监听助手 v1.3.4';
     const icon = document.createElement('div');
     icon.classList.add('inline-drawer-icon','fa-solid','fa-circle-chevron-down','down');
     header.append(title, icon);
@@ -824,6 +966,7 @@
 
     triggersWrap.append(colFail, colSuccess);
     content.append(triggersWrap);
+    content.append(makeCheckbox('记录判定日志（浏览器 F12 控制台，不含聊天正文）', 'debug'));
 
     // 2. 声音设置
     content.append(makeDivider('声音设置'));
@@ -882,7 +1025,6 @@
 
     // 5. 测试区
     content.append(makeDivider('功能测试'));
-    content.append(makeCheckbox('输出诊断日志（不记录回复内容）', 'debug'));
     content.append(makeTestRow());
 
     drawer.append(header, content);
