@@ -130,3 +130,36 @@ test('earlier request cannot mark a later request successful', async () => {
   await rig.flush();
   assert.deepEqual(rig.alerts, ['success']);
 });
+
+
+test('network-empty response waits for the final UI message before deciding', async () => {
+  const rig = setup();
+  await rig.start('swipe');
+  await rig.respond('');
+  assert.deepEqual(rig.alerts, [], 'no early empty alert on network-only verdict');
+  await rig.end('Finally generated text');
+  assert.deepEqual(rig.alerts, ['success']);
+  assert.equal(rig.logs[0][1].hasNetworkText, false);
+  assert.equal(rig.logs[0][1].hasFinalText, true);
+  assert.equal(rig.logs[0][1].rendered, 'new-swipe-text');
+});
+
+test('network-empty and final message empty is a failure once', async () => {
+  const rig = setup();
+  await rig.start('swipe');
+  await rig.respond('');
+  assert.deepEqual(rig.alerts, []);
+  await rig.end('');
+  assert.deepEqual(rig.alerts, ['empty/error']);
+  assert.equal(rig.logs[0][1].hasFinalText, false);
+});
+
+test('manual stop after network-empty completion emits no false empty alert', async () => {
+  const rig = setup();
+  await rig.start('swipe');
+  await rig.respond('');
+  rig.events.emit('stop');
+  rig.events.emit('end');
+  await rig.flush();
+  assert.deepEqual(rig.alerts, []);
+});

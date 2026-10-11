@@ -1,4 +1,4 @@
-// Response Monitor v1.3.4
+// Response Monitor v1.3.5
 // - 失败/空内容/成功生成 独立蜂鸣提示（含 iOS 振荡器兜底）、Android 振动
 // - text/html/Cloudflare 错误页判失败
 // - 成功提示支持“仅在后台生效”
@@ -506,14 +506,16 @@
     activeRound = null;
 
     const invalidContext = uiVerdict?.reason === 'chat-changed';
-    const hasReply = round.hasContent && uiVerdict?.valid !== false;
+    // A finalized SillyTavern message is authoritative. Network inspection is
+    // only a fallback when there is no applicable UI message to inspect.
+    const hasReply = typeof uiVerdict?.valid === 'boolean' ? uiVerdict.valid : round.hasContent;
     const outcome = round.aborted || invalidContext ? 'aborted'
       : !round.requestOk ? 'request-error'
       : !hasReply ? 'empty'
       : 'success';
 
     if (S.debug) {
-      console.info('[Response Monitor v1.3.4] generation #' + round.id, {
+      console.info('[Response Monitor v1.3.5] generation #' + round.id, {
         status: round.status,
         outcome,
         network: round.reason,
@@ -530,8 +532,9 @@
 
   function maybeFinishRound(round) {
     if (!round || round.finished || activeRound !== round || !round.responseFinished) return;
-    // An HTTP/network-level empty response must never be promoted to success.
-    if (!round.requestOk || !round.hasContent || round.aborted) {
+    // Even if SSE contains no recognized text, wait for SillyTavern's final
+    // rendered message: some providers use a format the network parser misses.
+    if (!round.requestOk || round.aborted) {
       finalizeRound(round);
       return;
     }
@@ -937,7 +940,7 @@
     const header = document.createElement('div');
     header.className = 'inline-drawer-toggle inline-drawer-header';
     const title = document.createElement('b');
-    title.textContent = '响应监听助手 v1.3.4';
+    title.textContent = '响应监听助手 v1.3.5';
     const icon = document.createElement('div');
     icon.classList.add('inline-drawer-icon','fa-solid','fa-circle-chevron-down','down');
     header.append(title, icon);
