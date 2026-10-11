@@ -1,4 +1,4 @@
-// Response Monitor v1.3.5
+// Response Monitor v1.3.6
 // - 失败/空内容/成功生成 独立蜂鸣提示（含 iOS 振荡器兜底）、Android 振动
 // - text/html/Cloudflare 错误页判失败
 // - 成功提示支持“仅在后台生效”
@@ -515,7 +515,7 @@
       : 'success';
 
     if (S.debug) {
-      console.info('[Response Monitor v1.3.5] generation #' + round.id, {
+      console.info('[Response Monitor v1.3.6] generation #' + round.id, {
         status: round.status,
         outcome,
         network: round.reason,
@@ -940,7 +940,7 @@
     const header = document.createElement('div');
     header.className = 'inline-drawer-toggle inline-drawer-header';
     const title = document.createElement('b');
-    title.textContent = '响应监听助手 v1.3.5';
+    title.textContent = '响应监听助手';
     const icon = document.createElement('div');
     icon.classList.add('inline-drawer-icon','fa-solid','fa-circle-chevron-down','down');
     header.append(title, icon);
@@ -969,7 +969,7 @@
 
     triggersWrap.append(colFail, colSuccess);
     content.append(triggersWrap);
-    content.append(makeCheckbox('记录判定日志（浏览器 F12 控制台，不含聊天正文）', 'debug'));
+    content.append(makeCheckbox('记录判定日志（仅供测试）', 'debug'));
 
     // 2. 声音设置
     content.append(makeDivider('声音设置'));
