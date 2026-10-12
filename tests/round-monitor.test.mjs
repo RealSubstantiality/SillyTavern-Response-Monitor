@@ -35,7 +35,7 @@ function setup(initial = 'Earlier swipe') {
   };
   const win = { fetch: async () => ({
     ok: true, status: 200, headers: { get: () => 'text/event-stream' },
-    clone: () => ({ text: () => new Promise(resolve => pending.push(resolve)) }),
+    clone: () => ({ text: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) }),
   }) };
   const monitor = factory(win, ctx,
     { debug: true, alertOnError: true, alertOnEmpty: true, alertOnSuccess: true },
@@ -53,14 +53,21 @@ function setup(initial = 'Earlier swipe') {
   };
   return {
     ctx, events, alerts, logs,
-    async start(type) {
+    async start(type, signal) {
       events.emit('start', type, {}, false);
       monitor.arm();
-      await win.fetch('/api/openai/chat/completions', { method: 'POST' });
+      await win.fetch('/api/openai/chat/completions', { method: 'POST', signal });
     },
     async respond(text) {
       assert.ok(pending.length);
-      pending.shift()(asSse(text));
+      pending.shift().resolve(asSse(text));
+      await flush();
+    },
+    async failRead(name = 'AbortError') {
+      assert.ok(pending.length);
+      const error = new Error('Cloned stream could not be read');
+      error.name = name;
+      pending.shift().reject(error);
       await flush();
     },
     async end(text, swipe = 1) {
@@ -162,4 +169,47 @@ test('manual stop after network-empty completion emits no false empty alert', as
   rig.events.emit('end');
   await rig.flush();
   assert.deepEqual(rig.alerts, []);
+});
+
+test('aborted clone reader still reports success when final Swipe is valid', async () => {
+  const rig = setup();
+  const signal = { aborted: false };
+  await rig.start('swipe', signal);
+  signal.aborted = true; // automated retry may cancel the transport after data was received
+  await rig.failRead('AbortError');
+  assert.deepEqual(rig.alerts, [], 'reader failure alone must not be considered a stop');
+  await rig.end('Valid new swipe');
+  assert.deepEqual(rig.alerts, ['success']);
+  assert.equal(rig.logs[0][1].network, 'stream-read-error');
+  assert.equal(rig.logs[0][1].monitorErrorName, 'AbortError');
+  assert.equal(rig.logs[0][1].signalAbortedAtReadError, true);
+  assert.equal(rig.logs[0][1].hasFinalText, true);
+});
+
+test('cloned reader failure with empty final Swipe is an empty reply', async () => {
+  const rig = setup();
+  await rig.start('swipe');
+  await rig.failRead('AbortError');
+  await rig.end('');
+  assert.deepEqual(rig.alerts, ['empty/error']);
+  assert.equal(rig.logs[0][1].rendered, 'rendered-reply-empty');
+});
+
+test('explicit manual stop still suppresses alerts after cloned reader failure', async () => {
+  const rig = setup();
+  await rig.start('swipe');
+  await rig.failRead('AbortError');
+  rig.events.emit('stop');
+  await rig.end('Partial');
+  assert.deepEqual(rig.alerts, []);
+  assert.equal(rig.logs[0][1].outcome, 'aborted');
+});
+
+test('other clone-reading errors can recover from successful final message', async () => {
+  const rig = setup();
+  await rig.start('swipe');
+  await rig.failRead('TypeError');
+  await rig.end('Recovered');
+  assert.deepEqual(rig.alerts, ['success']);
+  assert.equal(rig.logs[0][1].monitorErrorName, 'TypeError');
 });

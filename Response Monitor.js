@@ -1,4 +1,4 @@
-// Response Monitor v1.3.6
+// Response Monitor v1.3.7
 // - 失败/空内容/成功生成 独立蜂鸣提示（含 iOS 振荡器兜底）、Android 振动
 // - text/html/Cloudflare 错误页判失败
 // - 成功提示支持“仅在后台生效”
@@ -487,6 +487,9 @@
       uiFinished: false,
       status: null,
       reason: '',
+      monitorReadError: false,
+      monitorErrorName: null,
+      signalAbortedAtReadError: false,
       timeout: null,
       generation,
       before: snapshotChat(),
@@ -515,10 +518,14 @@
       : 'success';
 
     if (S.debug) {
-      console.info('[Response Monitor v1.3.6] generation #' + round.id, {
+      console.info('[Response Monitor v1.3.7] generation #' + round.id, {
         status: round.status,
         outcome,
         network: round.reason,
+        monitorReadError: round.monitorReadError,
+        monitorErrorName: round.monitorErrorName,
+        signalAbortedAtReadError: round.signalAbortedAtReadError,
+        stoppedByEvent: round.aborted,
         rendered: uiVerdict?.reason ?? 'not-applicable',
         hasNetworkText: round.hasContent,
         hasFinalText: uiVerdict?.valid ?? null,
@@ -638,11 +645,18 @@
             if (verdict.hasContent) markContent(round);
             endRound(round, isRequestOk && !verdict.isError, verdict.reason);
           }).catch(err => {
-            if (err?.name === 'AbortError' || init?.signal?.aborted || input?.signal?.aborted) markAbort(round);
-            endRound(round, false, 'stream-read-error');
+            // Reading our cloned stream can be aborted independently of the
+            // already-rendered reply (e.g. automatic re-roll cleanup). Do
+            // NOT mark the generation stopped just because this reader fails.
+            round.monitorReadError = true;
+            round.monitorErrorName = typeof err?.name === 'string' ? err.name : 'unknown';
+            round.signalAbortedAtReadError = Boolean(init?.signal?.aborted || input?.signal?.aborted);
+            endRound(round, isRequestOk, 'stream-read-error');
           });
         } catch {
-          endRound(round, false, 'response-clone-error');
+          round.monitorReadError = true;
+          round.monitorErrorName = 'CloneError';
+          endRound(round, isRequestOk, 'response-clone-error');
         }
         return res;
       } catch (err) {
